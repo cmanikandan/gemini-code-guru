@@ -1,0 +1,24 @@
+{
+  "security-gate": {
+    "enabled": true,
+    "pre_tool_execution": [
+      {
+        "matcher": "code_execution",
+        "hooks": [
+          {"type": "command", "command": "python3 /.agents/hooks-scripts/gate.py", "timeout": 10}
+        ]
+      }
+    ]
+  },
+  "protected-paths": {
+    "enabled": true,
+    "pre_tool_execution": [
+      {
+        "matcher": "write_file|delete_file|write_to_file|replace_file_content",
+        "hooks": [
+          {"type": "command", "command": "python3 /.agents/hooks-scripts/paths.py", "timeout": 5}
+        ]
+      }
+    ]
+  }
+}
