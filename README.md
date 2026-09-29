@@ -207,7 +207,13 @@ python3 setup_gemini.py presets
 
 ### 6.2 Comprehensive Guide: Where Gemini Managed Agents Can vs. Cannot Be Used
 
-Before onboarding a repository or labeling an issue, review the table below to understand which workloads thrive in Gemini Managed Agents and which workloads **cannot** be executed due to sandbox OS, hardware, network, or resource constraints:
+> [!NOTE]
+> **Disclaimer — Point-in-Time Platform Data**: The workload compatibility matrix, sandbox specifications, and resource limits below reflect **Gemini Managed Agents as of now (Public Preview)**. Because Managed Agents and remote environments are actively evolving, please refer to the latest official Gemini API documentation before making architectural decisions:
+> - **[Managed Agents Overview — Limits](https://ai.google.dev/gemini-api/docs/agents#limits)**
+> - **[Agent Environments — Limitations](https://ai.google.dev/gemini-api/docs/agent-environment#limitations)** & **[Pre-installed Software](https://ai.google.dev/gemini-api/docs/agent-environment#pre-installed-software)**
+> - **[Antigravity Agent Capabilities & Tools](https://ai.google.dev/gemini-api/docs/antigravity-agent)**
+
+Before onboarding a repository or labeling an issue, review the table below to understand which workloads thrive in Gemini Managed Agents and which workloads **cannot** be executed due to current sandbox OS, hardware, network, or resource constraints:
 
 | Application / Workload Category | Supported? | Detailed Technical Explanation ("Why / Why Not") |
 | :--- | :--- | :--- |
