@@ -1,6 +1,6 @@
 ---
 name: vuln-triage
-description: Scan the target open-source fork for known vulnerabilities and file one GitHub issue per new finding.
+description: Scan the target repository (enterprise, private, or open-source) for known vulnerabilities and file one GitHub issue per new finding.
 ---
 # Vulnerability triage
 

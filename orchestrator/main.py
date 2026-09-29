@@ -1,12 +1,15 @@
 """
-Orchestrator for event-driven open-source stewardship (remediation, features, modernization) with Gemini Managed Agents.
+Orchestrator for gemini-code-guru: event-driven autonomous software & security engineering (remediation, features, modernization)
+across any GitHub repository (enterprise, private, commercial, or open-source) using Gemini Managed Agents.
 
 Events in:
   POST /github-webhook   GitHub issues.labeled (agent:remediate|agent:feature|agent:modernize) and pull_request.closed (merge)
   POST /gemini-webhook   Gemini interaction.completed / failed / cancelled / requires_action
   POST /reconcile        Cloud Scheduler every 10 min: missed webhooks, timeouts, queue drain
+  POST /preflight        Pre-flight compatibility check for a repository or issue payload
 Out:
-  GET  /                 live dashboard     GET /metrics   JSON metrics     GET /runs   raw runs
+  GET  /                 live dashboard     GET /metrics         JSON metrics
+  GET  /runs             raw runs           GET /compatibility   Gemini Managed Agents platform limits & rules
 """
 from __future__ import annotations
 
@@ -20,11 +23,12 @@ from datetime import datetime, timedelta, timezone
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
+from compatibility import PLATFORM_LIMITS, check_issue_compatibility, check_repo_compatibility
 from github import GitHub, verify_signature
 from store import ACTIVE, TERMINAL, make_store, now
 
 REPO = os.environ.get("REPO", "cmanikandan/Flask-AppBuilder")
-AGENT_ID = os.environ.get("AGENT_ID", "gemini-oss-steward")
+AGENT_ID = os.environ.get("AGENT_ID", "gemini-code-guru")
 TRIGGER_LABEL = "agent:remediate"
 SKILL_BY_LABEL = {
     "agent:remediate": ("remediate", "vuln-fix", "remediate security issue"),
@@ -37,7 +41,7 @@ RUN_TIMEOUT_MIN = int(os.environ.get("RUN_TIMEOUT_MIN", "60"))
 USD_PER_MTOK = float(os.environ.get("USD_PER_MTOK", "0") or 0)  # blended rate you set; 0 = hide cost
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
-log = logging.getLogger("gemini-oss-steward")
+log = logging.getLogger("gemini-code-guru")
 
 
 def event(name: str, **fields) -> None:
@@ -45,7 +49,7 @@ def event(name: str, **fields) -> None:
     log.info(json.dumps({"event": name, "severity": "INFO", **fields}, default=str))
 
 
-app = FastAPI(title="gemini-oss-steward")
+app = FastAPI(title="gemini-code-guru")
 store = make_store()
 _gemini = None
 _gh = None
@@ -82,7 +86,7 @@ def parse_result(text: str | None) -> tuple[str, str]:
 
 
 def enqueue(issue: int, title: str = "", issue_created_at: str | None = None,
-            reason: str = "label", label: str = TRIGGER_LABEL) -> dict | None:
+            reason: str = "label", label: str = TRIGGER_LABEL, body: str = "") -> dict | None:
     runs = store.by_issue(issue)
     if any(r.get("status") in ACTIVE for r in runs):
         event("enqueue_skipped", issue=issue, why="already active")
@@ -90,6 +94,32 @@ def enqueue(issue: int, title: str = "", issue_created_at: str | None = None,
     attempt = (runs[-1]["attempt"] + 1) if runs else 1
     task_type, skill, _ = SKILL_BY_LABEL.get(label, SKILL_BY_LABEL[TRIGGER_LABEL])
     run_id = f"{issue}-{attempt}"
+
+    # Pre-flight compatibility gate: catch unsupported OS/hardware/network workloads before spending tokens.
+    compat = check_issue_compatibility(title, body)
+    if not compat["compatible"]:
+        ts = now()
+        detail = f"pre-flight compatibility gate ({compat['category']}): {compat['reason']}"
+        store.put(run_id, {
+            "issue": issue, "title": title[:200], "attempt": attempt, "status": "needs_human",
+            "result": "NEEDS_HUMAN", "detail": detail, "task_type": task_type, "skill": skill,
+            "trigger_label": label, "queued_at": ts, "started_at": ts, "ended_at": ts,
+            "issue_created_at": issue_created_at, "reason": reason, "tokens": 0, "duration_s": 0.0,
+            "preflight_blocked": True, "preflight_category": compat["category"],
+        })
+        event("preflight_blocked", run_id=run_id, issue=issue, category=compat["category"], detail=detail)
+        try:
+            gh().add_labels(issue, "agent:needs-human")
+            gh().comment(
+                issue,
+                f"Stopped by **Pre-Flight Compatibility Gate** (`{compat['category']}`) before provisioning a sandbox:\n\n"
+                f"> {compat['reason']}\n\n"
+                f"See [Gemini Managed Agents Limitations (Preview)]({compat['docs_url']}).",
+            )
+        except Exception as e:
+            event("github_update_failed", issue=issue, error=str(e)[:300])
+        return None
+
     store.put(run_id, {
         "issue": issue, "title": title[:200], "attempt": attempt, "status": "queued",
         "task_type": task_type, "skill": skill, "trigger_label": label,
@@ -200,10 +230,11 @@ async def github_webhook(request: Request, bg: BackgroundTasks,
     if x_github_event == "issues" and p.get("action") == "labeled" \
             and label_name in SKILL_BY_LABEL:
         i = p["issue"]
-        # Human gate: only people with triage/write access can label issues on the fork.
+        # Human gate: only people with triage/write access can label issues on the repository.
         event("github_event", kind="issue_labeled", label=label_name,
               issue=i["number"], sender=p.get("sender", {}).get("login"))
-        if enqueue(i["number"], i.get("title", ""), i.get("created_at"), label=label_name):
+        if enqueue(i["number"], i.get("title", ""), i.get("created_at"),
+                   label=label_name, body=i.get("body") or ""):
             bg.add_task(dispatch)
     elif x_github_event == "pull_request" and p.get("action") == "closed":
         pr = p["pull_request"]
@@ -264,7 +295,8 @@ def reconcile(authorization: str | None = Header(None)):
     for lbl in SKILL_BY_LABEL:
         for i in gh().issues_with_label(lbl):
             if not store.by_issue(i["number"]):
-                enqueue(i["number"], i.get("title", ""), i.get("created_at"), reason="backfill", label=lbl)
+                enqueue(i["number"], i.get("title", ""), i.get("created_at"),
+                        reason="backfill", label=lbl, body=i.get("body") or "")
                 backfilled += 1
     started = dispatch()
     event("reconciled", finished=finished, timed_out=timed_out, backfilled=backfilled, started=started)
@@ -290,10 +322,13 @@ def _pct(values, q):
 def compute_metrics(runs: list[dict]) -> dict:
     by = {s: 0 for s in ("queued", "running") + TERMINAL}
     by_task = {"remediate": 0, "feature": 0, "modernize": 0}
+    preflight_blocked = 0
     for r in runs:
         by[r.get("status", "queued")] = by.get(r.get("status", "queued"), 0) + 1
         tt = r.get("task_type", "remediate")
         by_task[tt] = by_task.get(tt, 0) + 1
+        if r.get("preflight_blocked"):
+            preflight_blocked += 1
     terminal = [r for r in runs if r.get("status") in TERMINAL]
     prs = [r for r in runs if r.get("status") == "pr_opened"]
     closed = [r for r in prs if "merged" in r]
@@ -317,6 +352,7 @@ def compute_metrics(runs: list[dict]) -> dict:
         "as_of": now().isoformat(timespec="seconds"),
         "counts": by,
         "by_task_type": by_task,
+        "preflight_blocked": preflight_blocked,
         "issues_touched": len(issues),
         "issues_with_pr": len(issues_fixed),
         "pr_rate": round(len(prs) / len(terminal), 3) if terminal else None,
@@ -334,6 +370,31 @@ def compute_metrics(runs: list[dict]) -> dict:
         m["usd_total"] = round(sum(tokens) / 1e6 * USD_PER_MTOK, 2)
         m["usd_per_pr"] = round(m["usd_total"] / len(prs), 2) if prs else None
     return m
+
+
+@app.get("/compatibility")
+def compatibility_info():
+    """Return Gemini Managed Agents (Public Preview) platform limits and guardrail categories."""
+    return PLATFORM_LIMITS
+
+
+@app.post("/preflight")
+async def preflight_endpoint(request: Request):
+    """Evaluate a repository or issue payload against Gemini Managed Agents platform guardrails."""
+    payload = await request.json()
+    issue_res = check_issue_compatibility(payload.get("title", ""), payload.get("body", ""))
+    repo_res = check_repo_compatibility(
+        repo_url=payload.get("repo_url"),
+        repo_size_kb=payload.get("repo_size_kb"),
+        file_paths=payload.get("file_paths"),
+        inline_sources=payload.get("inline_sources"),
+        allowlist=payload.get("allowlist"),
+    )
+    return {
+        "compatible": issue_res["compatible"] and repo_res["compatible"],
+        "issue_check": issue_res,
+        "repo_check": repo_res,
+    }
 
 
 @app.get("/metrics")

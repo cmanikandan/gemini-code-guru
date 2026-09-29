@@ -1,21 +1,36 @@
 """
-One-time setup of the Gemini side of the autonomous engineering & remediation system.
+One-time setup & pre-flight compatibility CLI for gemini-code-guru: the autonomous
+software engineering & security platform powered by Gemini Managed Agents (Public Preview).
 
-  python setup_gemini.py presets                 # list built-in open-source repo presets
-  python setup_gemini.py credentials             # validate GH_TOKEN and refresh agent network proxy rules
-  python setup_gemini.py agent [--preset NAME]   # create (or replace) the managed agent
-  python setup_gemini.py webhook --url URL       # register the static webhook -> orchestrator
-  python setup_gemini.py trigger                 # weekly triage trigger (Mon 08:00 IST)
-  python setup_gemini.py triage-now              # fire the triage trigger once, now
-  python setup_gemini.py status                  # list agent, network proxy rules, webhooks, triggers
+Works with ANY GitHub repository (private enterprise, commercial, internal service, or open-source fork):
+  python setup_gemini.py presets                                   # list built-in reference presets
+  python setup_gemini.py check [--repo OWNER/REPO] [--local-path .]# run pre-flight compatibility checks
+  python setup_gemini.py credentials [--repo OWNER/REPO]           # validate GH_TOKEN & egress proxy rules
+  python setup_gemini.py agent [--repo OWNER/REPO | --preset NAME] # create (or replace) the managed agent
+  python setup_gemini.py webhook --url URL                         # register the static webhook -> orchestrator
+  python setup_gemini.py trigger [--repo OWNER/REPO]               # weekly triage trigger (Mon 08:00 IST)
+  python setup_gemini.py triage-now                                # fire the triage trigger once, now
+  python setup_gemini.py status                                    # list agent, network proxy rules, webhooks, triggers
 
-Env: GEMINI_API_KEY, GH_TOKEN (fine-grained PAT scoped to your fork), REPO (optional), PRESET (optional).
+Env: GEMINI_API_KEY, GH_TOKEN (fine-grained PAT scoped to target repo), REPO (optional), PRESET (optional).
 """
 import argparse
 import base64
+import json
 import os
 import pathlib
 import sys
+import urllib.request
+
+ROOT = pathlib.Path(__file__).parent
+HERE = ROOT / "agent"
+sys.path.insert(0, str(ROOT / "orchestrator"))
+
+from compatibility import (  # noqa: E402
+    PLATFORM_LIMITS,
+    check_issue_compatibility,
+    check_repo_compatibility,
+)
 
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "cmanikandan")
 
@@ -51,14 +66,12 @@ if PRESET not in PRESETS:
     raise SystemExit(f"Unknown PRESET={PRESET!r}. Choose from: {', '.join(PRESETS)}")
 
 REPO = os.environ.get("REPO", PRESETS[PRESET]["repo"])
-AGENT_ID = os.environ.get("AGENT_ID", "gemini-oss-steward")
+AGENT_ID = os.environ.get("AGENT_ID", "gemini-code-guru")
 BASE_AGENT = os.environ.get("BASE_AGENT", "antigravity-preview-05-2026")
 MODEL = os.environ.get("AGENT_MODEL", "gemini-3.8-flash")
 MAX_TOTAL_TOKENS = int(os.environ.get("MAX_TOTAL_TOKENS", "3000000"))  # per-run budget
-TRIGGER_NAME = os.environ.get("TRIGGER_NAME", "oss-steward-weekly-triage")
-WEBHOOK_NAME = os.environ.get("WEBHOOK_NAME", "gemini-oss-steward")
-
-HERE = pathlib.Path(__file__).parent / "agent"
+TRIGGER_NAME = os.environ.get("TRIGGER_NAME", "code-guru-weekly-triage")
+WEBHOOK_NAME = os.environ.get("WEBHOOK_NAME", "gemini-code-guru")
 
 
 def get_client():
@@ -93,7 +106,7 @@ def network(gh_token: str | None = None) -> dict:
 
 
 def sources(repo: str = REPO) -> list:
-    """Mount the fork plus AGENTS.md, all skills, and hooks into every sandbox."""
+    """Mount the target repository plus AGENTS.md, all skills, and hooks into every sandbox."""
     inline = {
         ".agents/AGENTS.md": HERE / "AGENTS.md",
         ".agents/skills/vuln-triage/SKILL.md": HERE / "skills/vuln-triage/SKILL.md",
@@ -110,23 +123,99 @@ def sources(repo: str = REPO) -> list:
 
 
 def _resolve_repo(args) -> str:
+    explicit = getattr(args, "repo", None)
+    if explicit:
+        return explicit
     preset = getattr(args, "preset", None)
     if preset:
         return PRESETS[preset]["repo"]
     return REPO
 
 
+def _fetch_github_repo_meta(repo: str) -> tuple[int | None, list[str]]:
+    """Best-effort fetch of GitHub repo size (KB) and root file paths when GH_TOKEN is set."""
+    token = os.environ.get("GH_TOKEN", "")
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "gemini-code-guru"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    size_kb = None
+    paths: list[str] = []
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{repo}", headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            meta = json.loads(resp.read().decode())
+            size_kb = meta.get("size")
+        req_tree = urllib.request.Request(f"https://api.github.com/repos/{repo}/contents", headers=headers)
+        with urllib.request.urlopen(req_tree, timeout=8) as resp:
+            items = json.loads(resp.read().decode())
+            if isinstance(items, list):
+                paths = [item.get("path", "") for item in items if isinstance(item, dict)]
+    except Exception:
+        pass
+    return size_kb, paths
+
+
 def cmd_presets(_):
+    print("Built-in reference presets (any custom repo can also be used via --repo OWNER/REPO or REPO=OWNER/REPO):")
     for name, info in PRESETS.items():
         marker = "*" if name == PRESET else " "
-        print(f"{marker} {name:18s} fork={info['repo']:30s} upstream={info['upstream']} ({info['description']})")
+        print(f"{marker} {name:18s} target={info['repo']:30s} upstream={info['upstream']} ({info['description']})")
+
+
+def cmd_check(args):
+    """Run pre-flight Gemini Managed Agents compatibility checks on the target repository & issue."""
+    repo = _resolve_repo(args)
+    srcs = sources(repo)
+    repo_url = srcs[0]["source"]
+    allowlist = network("placeholder-token")["allowlist"]
+    size_kb, remote_paths = (None, [])
+    if not getattr(args, "offline", False):
+        size_kb, remote_paths = _fetch_github_repo_meta(repo)
+
+    report = check_repo_compatibility(
+        repo_url=repo_url,
+        repo_size_kb=size_kb,
+        file_paths=remote_paths,
+        local_dir=getattr(args, "local_path", None),
+        inline_sources=srcs[1:],
+        allowlist=allowlist,
+    )
+
+    print(f"=== Gemini Managed Agents (Preview) Pre-Flight Compatibility Check: {repo} ===")
+    print(f"Release Stage : {PLATFORM_LIMITS['release_stage']}")
+    print(f"Sandbox Spec  : {PLATFORM_LIMITS['sandbox_os']} · {PLATFORM_LIMITS['cpu_cores']} vCPU · "
+          f"{PLATFORM_LIMITS['memory_gb']} GB RAM · GPU/TPU={PLATFORM_LIMITS['gpu_or_tpu']}")
+    print(f"Source Caps   : Git <= {PLATFORM_LIMITS['max_git_repo_mb']} MB · "
+          f"GCS <= {PLATFORM_LIMITS['max_gcs_source_mb']} MB · "
+          f"Inline <= {PLATFORM_LIMITS['max_inline_total_bytes'] // 1_000_000} MB total")
+    if size_kb is not None:
+        print(f"Detected Size : {round(size_kb / 1024, 1)} MB on GitHub")
+
+    issue_title = getattr(args, "issue_title", None)
+    issue_body = getattr(args, "issue_body", "") or ""
+    issue_ok = True
+    if issue_title:
+        ic = check_issue_compatibility(issue_title, issue_body)
+        issue_ok = ic["compatible"]
+        if not ic["compatible"]:
+            report["blockers"].append(f"Issue pre-flight blocked ({ic['category']}): {ic['reason']}")
+
+    for w in report["warnings"]:
+        print(f"  [WARN]    {w}")
+    for b in report["blockers"]:
+        print(f"  [BLOCKER] {b}")
+
+    if report["compatible"] and issue_ok:
+        print("Result: COMPATIBLE — ready for Gemini Managed Agent execution.")
+    else:
+        sys.exit("Result: INCOMPATIBLE — resolve blockers above or route workload to a custom runner.")
 
 
 def cmd_credentials(args):
     """Validate GH_TOKEN and configure egress-proxy header transforms (recreates agent if already present)."""
     token = os.environ.get("GH_TOKEN", "")
     if not token:
-        sys.exit("GH_TOKEN is not set. Export a fine-grained GitHub PAT scoped to your fork first.")
+        sys.exit("GH_TOKEN is not set. Export a fine-grained GitHub PAT scoped to your target repository first.")
     net = network(token)
     domains = [entry["domain"] for entry in net["allowlist"] if "transform" in entry]
     print(f"validated GH_TOKEN for egress proxy header transform on: {', '.join(domains)}")
@@ -141,6 +230,23 @@ def cmd_credentials(args):
 
 def cmd_agent(args):
     repo = _resolve_repo(args)
+    srcs = sources(repo)
+    net = network()
+    size_kb, remote_paths = _fetch_github_repo_meta(repo)
+    preflight = check_repo_compatibility(
+        repo_url=srcs[0]["source"],
+        repo_size_kb=size_kb,
+        file_paths=remote_paths,
+        inline_sources=srcs[1:],
+        allowlist=net["allowlist"],
+    )
+    for w in preflight["warnings"]:
+        print(f"[pre-flight warning] {w}")
+    if not preflight["compatible"]:
+        for b in preflight["blockers"]:
+            print(f"[pre-flight blocker] {b}", file=sys.stderr)
+        sys.exit("Aborted agent creation due to Gemini Managed Agents platform compatibility blockers.")
+
     client = get_client()
     try:
         client.agents.delete(id=AGENT_ID)  # preview has no versioning: replace in place
@@ -153,13 +259,14 @@ def cmd_agent(args):
         base_agent=BASE_AGENT,
         agent_config={"type": "antigravity", "model": MODEL, "max_total_tokens": MAX_TOTAL_TOKENS},
         system_instruction=(
-            f"You are a senior software and application-security engineer maintaining the fork {repo}. "
+            f"You are a senior software and application-security engineer maintaining the repository {repo}. "
             "Follow /.agents/AGENTS.md strictly. Use vuln-triage for scans, vuln-fix for security remediation, "
             "feature-build for feature requests, and code-modernize for code modernization. "
-            "End with the RESULT line defined in AGENTS.md."
+            "If a task requires an unsupported OS/runtime (native Windows, macOS/Xcode, GPU, kernel modules), "
+            "stop immediately and emit RESULT: NEEDS_HUMAN. End with the RESULT line defined in AGENTS.md."
         ),
         tools=[{"type": "code_execution"}, {"type": "url_context"}, {"type": "google_search"}],
-        base_environment={"type": "remote", "sources": sources(repo), "network": network()},
+        base_environment={"type": "remote", "sources": srcs, "network": net},
     )
     print(f"created agent {agent.id} for {repo} on {BASE_AGENT} / {MODEL}")
 
@@ -237,17 +344,28 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("presets").set_defaults(fn=cmd_presets)
+    chk = sub.add_parser("check", help="run pre-flight Gemini Managed Agents compatibility checks")
+    chk.add_argument("--preset", choices=list(PRESETS), help="built-in repository preset")
+    chk.add_argument("--repo", help="target GitHub repository (owner/repo) — enterprise, private, or OSS")
+    chk.add_argument("--local-path", help="optional local checkout directory to scan for incompatible project files")
+    chk.add_argument("--issue-title", help="optional issue title to test against the issue pre-flight gate")
+    chk.add_argument("--issue-body", default="", help="optional issue body to test against the issue pre-flight gate")
+    chk.add_argument("--offline", action="store_true", help="skip live GitHub API metadata lookup")
+    chk.set_defaults(fn=cmd_check)
     c_p = sub.add_parser("credentials")
-    c_p.add_argument("--preset", choices=list(PRESETS), help="open-source repository preset")
+    c_p.add_argument("--preset", choices=list(PRESETS), help="built-in repository preset")
+    c_p.add_argument("--repo", help="target GitHub repository (owner/repo)")
     c_p.set_defaults(fn=cmd_credentials)
     a_p = sub.add_parser("agent")
-    a_p.add_argument("--preset", choices=list(PRESETS), help="open-source repository preset")
+    a_p.add_argument("--preset", choices=list(PRESETS), help="built-in repository preset")
+    a_p.add_argument("--repo", help="target GitHub repository (owner/repo)")
     a_p.set_defaults(fn=cmd_agent)
     w = sub.add_parser("webhook")
-    w.add_argument("--url", required=True, help="orchestrator base URL, e.g. https://gemini-oss-steward-xyz.a.run.app")
+    w.add_argument("--url", required=True, help="orchestrator base URL, e.g. https://gemini-code-guru-xyz.a.run.app")
     w.set_defaults(fn=cmd_webhook)
     t_p = sub.add_parser("trigger")
-    t_p.add_argument("--preset", choices=list(PRESETS), help="open-source repository preset")
+    t_p.add_argument("--preset", choices=list(PRESETS), help="built-in repository preset")
+    t_p.add_argument("--repo", help="target GitHub repository (owner/repo)")
     t_p.set_defaults(fn=cmd_trigger)
     sub.add_parser("triage-now").set_defaults(fn=cmd_triage_now)
     sub.add_parser("status").set_defaults(fn=cmd_status)

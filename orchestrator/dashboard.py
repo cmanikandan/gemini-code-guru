@@ -39,12 +39,14 @@ STATUS_CLASS = {"pr_opened": "good", "running": "info", "queued": "muted", "need
 def render(m: dict, runs: list[dict], repo: str) -> str:
     c = m["counts"]
     bt = m.get("by_task_type", {})
+    pf = m.get("preflight_blocked", 0)
     task_note = f'sec {bt.get("remediate", 0)} · feat {bt.get("feature", 0)} · mod {bt.get("modernize", 0)}'
+    esc_note = f"agent chose to stop ({pf} pre-flight)" if pf else "agent chose to stop"
     tiles = "".join([
         _tile("In flight", f'{c["running"]} running · {c["queued"]} queued', task_note),
         _tile("PR-opened rate", _fmt(m["pr_rate"], pct=True), "of finished runs"),
         _tile("Merge rate", _fmt(m["merge_rate"], pct=True), "of agent PRs closed"),
-        _tile("Escalated to humans", _fmt(m["escalation_rate"], pct=True), "agent chose to stop"),
+        _tile("Escalated to humans", _fmt(m["escalation_rate"], pct=True), esc_note),
         _tile("Time to PR (p50 / p90)",
               f'{_fmt(m["time_to_pr_minutes_p50"])} / {_fmt(m["time_to_pr_minutes_p90"])} min', "agent run time"),
         _tile("Issue → PR (p50)", _fmt(m["issue_to_pr_hours_p50"], " h"), "exposure window"),
@@ -68,7 +70,7 @@ def render(m: dict, runs: list[dict], repo: str) -> str:
             f'<td class="num">{r.get("tokens") or "–"}</td></tr>')
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30">
-<title>gemini-oss-steward · {escape(repo)}</title><style>
+<title>gemini-code-guru · {escape(repo)}</title><style>
 :root{{--bg:#fafaf9;--card:#fff;--ink:#1c1917;--mute:#78716c;--line:#e7e5e4;--accent:#2563eb;
 --good:#15803d;--warn:#b45309;--bad:#b91c1c;--info:#2563eb}}
 @media (prefers-color-scheme:dark){{:root{{--bg:#0c0a09;--card:#1c1917;--ink:#f5f5f4;--mute:#a8a29e;
@@ -87,7 +89,7 @@ th{{color:var(--mute);font-weight:500;font-size:12px}} .num{{text-align:right;fo
 .good{{color:var(--good)}} .warn{{color:var(--warn)}} .bad{{color:var(--bad)}} .info{{color:var(--info)}}
 .muted{{color:var(--mute)}} h2{{font-size:15px;margin:0 0 10px}}
 </style></head><body><main>
-<h1>gemini-oss-steward · {escape(repo)}</h1>
+<h1>gemini-code-guru · {escape(repo)}</h1>
 <div class="sub">Gemini managed agent · as of {escape(m["as_of"])} UTC · refreshes every 30 s ·
 <a href="/metrics">metrics JSON</a></div>
 <div class="grid">{tiles}</div>
