@@ -271,3 +271,74 @@ def test_protected_paths_hook():
     assert run_paths("/workspace/repo/LICENSE") == "deny"
     assert run_paths("/workspace/repo/src/LICENSE_HEADER.py") == "allow"
     assert run_paths("/workspace/repo/src/security/manager.py") == "allow"
+
+
+def test_dashboard_auth_session_basic_and_bearer():
+    client, _, _ = setup()
+    main.DASHBOARD_USER = "admin"
+    main.DASHBOARD_PASSWORD = "test-secret-password"
+    try:
+        # Unauthenticated requests are rejected with 401
+        assert client.get("/").status_code == 401
+        assert "Sign in to Dashboard" in client.get("/").text
+        assert client.get("/metrics").status_code == 401
+        assert client.get("/runs").status_code == 401
+        assert client.get("/compatibility").status_code == 401
+
+        # HTTP Basic Auth works
+        assert client.get("/metrics", auth=("admin", "test-secret-password")).status_code == 200
+        assert client.get("/metrics", auth=("admin", "wrong")).status_code == 401
+
+        # Bearer token works
+        assert client.get("/runs", headers={"Authorization": "Bearer test-secret-password"}).status_code == 200
+
+        # Form login sets session cookie and unlocks dashboard
+        login_res = client.post(
+            "/login",
+            content="username=admin&password=test-secret-password",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            follow_redirects=False,
+        )
+        assert login_res.status_code == 303
+        cookie_val = login_res.cookies.get("cg_session")
+        assert cookie_val
+        client.cookies.set("cg_session", cookie_val)
+        dash = client.get("/")
+        assert dash.status_code == 200 and "sign out" in dash.text
+
+        # Logout clears cookie
+        out_res = client.get("/logout", follow_redirects=False)
+        assert out_res.status_code == 303
+    finally:
+        main.DASHBOARD_PASSWORD = ""
+
+
+def test_sandbox_runtime_and_cost_per_run_metrics():
+    client, fi, _ = setup()
+    assert gh_post(client, "issues", labeled(61, "agent:feature"), "c1").status_code == 200
+    fi.items["int-1"].status = "completed"
+    fi.items["int-1"].output_text = "RESULT: PR_OPENED https://github.com/cmanikandan/sqlglot/pull/4"
+    fi.items["int-1"].usage = SimpleNamespace(
+        total_tokens=2_468_888,
+        total_input_tokens=2_439_356,
+        total_cached_tokens=2_220_032,
+        total_output_tokens=10_921,
+        total_thought_tokens=18_611,
+    )
+    fi.items["int-1"].steps = [SimpleNamespace(), SimpleNamespace(), SimpleNamespace()]
+    main.handle_interaction_event("int-1")
+
+    run = main.store.get("61-1")
+    assert run["sandbox_s"] is not None
+    assert run["provision_s"] is not None
+    assert run["cached_tokens"] == 2_220_032
+    assert 0.13 <= run["cost_usd"] <= 0.14  # ~$0.1339 with 91% context caching
+    assert run["sandbox_steps"] == 3
+
+    m = client.get("/metrics").json()
+    assert m["sandbox_minutes_p50"] is not None
+    assert m["cache_hit_rate"] == 0.91
+    assert 0.13 <= m["usd_per_run_avg"] <= 0.14
+    html = client.get("/").text
+    assert "Sandbox Runtime" in html and "Est. Cost" in html and "$0.134" in html
+

@@ -18,12 +18,12 @@ for role in roles/datastore.user roles/secretmanager.secretAccessor roles/loggin
 done
 
 # Public URL is required for the GitHub and Gemini webhooks; both are signature-verified,
-# /reconcile requires a bearer token, and the dashboard shows no secrets.
+# /reconcile requires a bearer token, and the dashboard requires DASHBOARD_USER / DASHBOARD_PASSWORD.
 gcloud run deploy "$SERVICE" --source orchestrator --region "$REGION" \
-  --service-account "$SA" --allow-unauthenticated \
+  --service-account "$SA" --allow-unauthenticated --no-invoker-iam-check --no-cpu-throttling --quiet \
   --min-instances 0 --max-instances 2 --concurrency 20 --timeout 300 \
-  --set-env-vars "STORE=firestore,REPO=${REPO:-cmanikandan/Flask-AppBuilder},AGENT_ID=${AGENT_ID:-gemini-code-guru},MAX_CONCURRENT=3,RUN_TIMEOUT_MIN=60" \
-  --set-secrets "GEMINI_API_KEY=gemini-api-key:latest,GH_TOKEN=github-token:latest,GITHUB_WEBHOOK_SECRET=github-webhook-secret:latest,GEMINI_WEBHOOK_SECRET=gemini-webhook-secret:latest,RECONCILE_TOKEN=reconcile-token:latest"
+  --set-env-vars "STORE=firestore,REPO=${REPO:-cmanikandan/Flask-AppBuilder},AGENT_ID=${AGENT_ID:-code-guru},MAX_CONCURRENT=3,RUN_TIMEOUT_MIN=60,DASHBOARD_USER=${DASHBOARD_USER:-admin}" \
+  --set-secrets "GEMINI_API_KEY=gemini-api-key:latest,GH_TOKEN=github-token:latest,GITHUB_WEBHOOK_SECRET=github-webhook-secret:latest,GEMINI_WEBHOOK_SECRET=gemini-webhook-secret:latest,RECONCILE_TOKEN=reconcile-token:latest,DASHBOARD_PASSWORD=dashboard-password:latest"
 
 URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format 'value(status.url)')
 TOKEN=$(gcloud secrets versions access latest --secret reconcile-token)

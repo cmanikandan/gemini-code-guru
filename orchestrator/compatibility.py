@@ -34,6 +34,10 @@ PLATFORM_LIMITS = {
     "max_inline_total_bytes": 2_000_000,  # 2 MB total across all inline files
     "environment_ttl_days": 7,
     "max_managed_agents_per_project": 1000,
+    "reserved_agent_id_prefixes": [
+        "antigravity-", "veo-", "omni-", "lyria-", "imagen-", "gemma-", "gemini-", "google-",
+        "youtube-", "android-", "chrome-", "pixel-", "waze-", "fitbit-", "nest-", "kaggle-",
+    ],
     "native_file_modalities": ["text", "image"],
     "docs_url": DOCS_LIMITS_URL,
 }

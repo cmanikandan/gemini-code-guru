@@ -65,11 +65,11 @@ Across private enterprise repositories, commercial SaaS codebases, and open-sour
 | System Requirement | Traditional Agent Runner Concept | Gemini Managed Agents Primitive Used in `gemini-code-guru` |
 | :--- | :--- | :--- |
 | **Scheduled repo scanning** | Cron job + custom container | **Scheduled Trigger** (`client.triggers.create`) invoking the `vuln-triage` skill weekly (`0 8 * * 1` IST) |
-| **Event-driven session start** | Webhook calls session API | GitHub `issues.labeled` webhook $\rightarrow$ Orchestrator Pre-Flight Gate $\rightarrow$ `client.interactions.create(agent="gemini-code-guru", environment="remote", background=True)` |
-| **Reusable agent definition** | Template / playbook config | **Saved Managed Agent** (`client.agents.create(id="gemini-code-guru", base_agent="antigravity-preview-05-2026")`) |
+| **Event-driven session start** | Webhook calls session API | GitHub `issues.labeled` webhook $\rightarrow$ Orchestrator Pre-Flight Gate $\rightarrow$ `client.interactions.create(agent="code-guru", environment="remote", background=True)` |
+| **Reusable agent definition** | Template / playbook config | **Saved Managed Agent** (`client.agents.create(id="code-guru", base_agent="antigravity-preview-05-2026")`) |
 | **Clean per-issue isolation** | Ephemeral VM per run | Every `interactions.create` call forks the agent's `base_environment` so each issue starts from a clean checkout at `/workspace/repo` |
 | **Session lifecycle management** | Poll / message / kill | `client.interactions.get(id)`, `previous_interaction_id` for multi-turn continuation, `client.interactions.cancel(id)` for timeouts |
-| **Completion notifications** | Polling loop or custom callback | **Gemini Static Webhook** (`client.webhooks.create`) subscribing to `interaction.completed`, `.failed`, `.cancelled`, `.requires_action` |
+| **Completion notifications** | Polling loop or custom callback | **Gemini Static Webhook** (`client.webhooks.create`) subscribing to `interaction.completed`, `.failed`, `.requires_action` |
 | **Knowledge & playbooks** | Prompt templates | Declarative `.agents/AGENTS.md` and `.agents/skills/<name>/SKILL.md` mounted into the sandbox via `InlineSource` |
 | **Zero-trust secret handling** | Secrets store / env vars | **Egress Proxy Header Transform** (`network.allowlist[].transform`) — injects `Authorization: Bearer <PAT>` (`api.github.com`) and `Authorization: Basic <base64>` (`github.com`) on the wire; the token never enters the sandbox |
 | **Deterministic guardrails** | Wrapper scripts | **Pre-Flight Compatibility Gate** (`compatibility.py`) + **Network Allowlist** + **`pre_tool_execution` Hooks** (`gate.py` & `paths.py`) |
@@ -81,7 +81,23 @@ Across private enterprise repositories, commercial SaaS codebases, and open-sour
 
 Two agent run patterns (scheduled triage and event-driven issue execution), a pre-flight compatibility gate, two signed webhooks (GitHub and Gemini), a Cloud Scheduler safety-net reconciler, and a FastAPI Cloud Run service form a closed loop.
 
+![End-to-End Issue-to-PR Sequence Diagram & Module Architecture](assets/end_to_end_sequence_flow.jpg)
+
 ![Issue-to-PR Lifecycle, Pre-Flight Short-Circuit & Human Escalation Flow](assets/issue_lifecycle_flow.jpg)
+
+### End-to-End Sequence Flow Across Modules
+
+| Step | Source $\rightarrow$ Target Module | Code Module | Action & Verification |
+| :--- | :--- | :--- | :--- |
+| **1** | **GitHub** $\rightarrow$ **Cloud Run Orchestrator** | `orchestrator/github.py` & `orchestrator/main.py` | Labeling an issue (`agent:remediate`, `agent:feature`, or `agent:modernize`) sends `POST /github-webhook`, verified via `X-Hub-Signature-256` HMAC-SHA256 and deduplicated by `X-GitHub-Delivery`. |
+| **2** | **Orchestrator** $\rightarrow$ **Pre-Flight Gate & Firestore** | `orchestrator/compatibility.py` & `orchestrator/store.py` | `check_issue_compatibility()` inspects the workload. Unsupported OS/hardware (Windows/WinForms, macOS/Xcode, GPU/CUDA) short-circuits in `<1s` (`0 tokens`, `$0.00`) to `agent:needs-human`. Compatible Linux issues are queued in Firestore (`agent_runs`). |
+| **3** | **Orchestrator** $\rightarrow$ **Gemini Managed Agent Sandbox** | `orchestrator/main.py:dispatch` | `interactions.create(agent="code-guru", environment="remote", background=True)` forks the saved agent's base environment (`4 vCPU / 16 GB RAM` Ubuntu Linux) and clones `/workspace/repo`. |
+| **4** | **Orchestrator** $\rightarrow$ **GitHub** | `orchestrator/github.py` | Adds label `agent:in-progress` and posts a tracking comment with the Gemini `interaction_id`. |
+| **5** | **Gemini Sandbox Internal** | `agent/AGENTS.md` & `agent/skills/*/SKILL.md` | `antigravity-preview-05-2026` (`gemini-3.8-flash`) loads `/.agents/AGENTS.md` and the routed skill (`vuln-fix`, `feature-build`, or `code-modernize`). |
+| **6** | **Gemini Sandbox** $\leftrightarrow$ **Hooks Gate** | `agent/hooks.json`, `gate.py`, `paths.py` | Every `code_execution` and file-write tool call passes through deterministic `pre_tool_execution` hooks (blocking `.github/`, `.agents/`, `LICENSE`, force-pushes, or env dumps). |
+| **7** | **Gemini Sandbox TDD Loop** | `/workspace/repo` | Creates branch `agent/issue-<n>`, writes a failing unit test, implements the fix/feature, and runs `pytest` until green. |
+| **8** | **Gemini Sandbox** $\rightarrow$ **Egress Proxy** $\rightarrow$ **GitHub** | `setup_gemini.py:network` | Pushes `agent/issue-<n>` and calls `POST /repos/<owner>/<repo>/pulls`. The Gemini Egress Proxy injects `Authorization` headers on the wire so raw credentials never enter the sandbox. |
+| **9** | **Gemini** $\rightarrow$ **Orchestrator** $\rightarrow$ **Firestore & GitHub** | `orchestrator/main.py:finalize` | `POST /gemini-webhook` (`interaction.completed`) triggers `finalize()`, recording `sandbox_s`, token cache breakdown (`input_tokens`, `cached_tokens`, `output_tokens`), and `cost_usd` in Firestore, and swapping the GitHub label to `agent:pr-open`. |
 
 ### Component Responsibilities
 
@@ -90,10 +106,10 @@ Two agent run patterns (scheduled triage and event-driven issue execution), a pr
 | **Pre-Flight Compatibility Gate** | CLI (`setup_gemini.py check`) & Orchestrator (`compatibility.py`) | Validates repository size ($\le 500\text{ MB}$), inline sources ($\le 2\text{ MB}$), HTTPS protocol, network allowlist hostnames, project file trees, and issue descriptions. Immediately short-circuits unsupported OS/hardware workloads (e.g., native Windows/WinForms/.NET Framework 4.x, macOS/Xcode, GPU/CUDA, kernel modules) to `agent:needs-human` with **zero sandbox tokens spent**. |
 | **Triage Agent** | Gemini Trigger (weekly) | Scans `/workspace/repo` with `pip-audit`, `bandit`, and `npm audit`; deduplicates against existing issues; files up to 10 `[vuln]` issues; labels critical/high findings that have a fixed version with `agent:remediate`. |
 | **Engineering Agent** | Gemini Managed Agent (1 sandbox/issue) | Executes `vuln-fix`, `feature-build`, or `code-modernize`; runs unit tests and linters (max 2 attempts); pushes `agent/issue-<n>`; opens a structured PR or escalates with `NEEDS_HUMAN`. |
-| **Orchestrator** | Cloud Run (FastAPI) | Verifies GitHub (`X-Hub-Signature-256`) and Gemini (Standard Webhooks) signatures; runs pre-flight issue checks; enforces `MAX_CONCURRENT=3`; dispatches background interactions; retries transient infrastructure failures once; updates GitHub labels and comments. |
-| **Run Store** | Firestore (`runs`, `runs_deliveries`) | Stores one document per run attempt (`<issue>-<attempt>`) with status, interaction ID, task type, skill, pre-flight status, duration, token usage, and PR URL, plus webhook delivery deduplication. Uses an in-memory store (`STORE=memory`) for local tests. |
-| **Reconciler** | Cloud Scheduler (every 10 min) | Calls `POST /reconcile` with a bearer token to finalize runs whose Gemini webhook was missed, cancel runs older than `RUN_TIMEOUT_MIN` (60 min), backfill labeled GitHub issues whose webhook was missed, and drain the queue. |
-| **Dashboard** | Cloud Run (`GET /`, `GET /metrics`, `GET /runs`, `GET /compatibility`) | Server-rendered HTML dashboard (light/dark mode, auto-refreshes every 30s) displaying in-flight runs by task type, PR-opened rate, merge rate, escalation rate (including pre-flight blocks), p50/p90 time-to-PR, exposure window, token/dollar cost per PR, and a 14-day throughput chart. |
+| **Orchestrator** | Cloud Run (FastAPI) | Verifies GitHub (`X-Hub-Signature-256`) and Gemini (Standard Webhooks) signatures; enforces dashboard/API authentication; runs pre-flight issue checks; enforces `MAX_CONCURRENT=3`; dispatches background interactions; retries transient infrastructure failures once; updates GitHub labels and comments. |
+| **Run Store** | Firestore (`agent_runs`, `agent_deliveries`) | Stores one document per run attempt (`<issue>-<attempt>`) with status, interaction ID, task type, skill, pre-flight status, sandbox duration (`sandbox_s`), granular token cache usage, estimated USD cost (`cost_usd`), and PR URL, plus webhook delivery deduplication. Uses an in-memory store (`STORE=memory`) for local tests. |
+| **Reconciler** | Cloud Scheduler (every 10 min) | Calls `POST /reconcile` with a bearer token to finalize runs whose Gemini webhook was missed, cancel runs older than `RUN_TIMEOUT_MIN` (60 min), backfill granular token/cost telemetry, backfill labeled GitHub issues whose webhook was missed, and drain the queue. |
+| **Authenticated Dashboard** | Cloud Run (`GET /login`, `GET /`, `GET /metrics`, `GET /runs`, `GET /compatibility`) | Protected by `DASHBOARD_USER` / `DASHBOARD_PASSWORD` (Session Cookie, HTTP Basic Auth, or Bearer Token). Displays in-flight runs by task type, PR-opened rate, merge rate, escalation rate, p50/p90 sandbox runtime, cumulative sandbox minutes, token cache hit rate, USD cost per run/PR, and a 14-day throughput chart. |
 
 ---
 
@@ -351,7 +367,7 @@ export GH_TOKEN="<your-fine-grained-github-pat>"
    # python3 setup_gemini.py agent --preset sqlglot
    ```
    This runs `check_repo_compatibility()` and calls `client.agents.create()` with:
-   - `id="gemini-code-guru"`
+   - `id="code-guru"` *(note: `gemini-*` and `antigravity-*` are reserved prefixes in the Gemini Managed Agents API)*
    - `base_agent="antigravity-preview-05-2026"`
    - `agent_config={"type": "antigravity", "model": "gemini-3.8-flash", "max_total_tokens": 3000000}`
    - `tools=[{"type": "code_execution"}, {"type": "url_context"}, {"type": "google_search"}]`
@@ -361,23 +377,26 @@ export GH_TOKEN="<your-fine-grained-github-pat>"
 
 ### Step 3: Deploy the Cloud Run Orchestrator
 
-1. **Create Secret Manager secrets** in your Google Cloud project:
+1. **Create Secret Manager secrets** in your Google Cloud project (including `dashboard-password` to protect the live dashboard and JSON endpoints):
    ```bash
    printf %s "$GEMINI_API_KEY" | gcloud secrets create gemini-api-key --data-file=-
    printf %s "$GH_TOKEN"       | gcloud secrets create github-token --data-file=-
    openssl rand -hex 32 | tr -d '\n' | gcloud secrets create github-webhook-secret --data-file=-
    openssl rand -hex 32 | tr -d '\n' | gcloud secrets create reconcile-token --data-file=-
+   printf "Guru-%s!" "$(openssl rand -hex 6)" | gcloud secrets create dashboard-password --data-file=-
    printf placeholder | gcloud secrets create gemini-webhook-secret --data-file=-
    ```
 2. **Deploy to Cloud Run and create the Cloud Scheduler reconciler**:
    ```bash
    PROJECT=<YOUR_GCP_PROJECT_ID> REPO="$R" ./deploy.sh
    ```
-   `deploy.sh` creates the `code-guru` service account with least-privilege IAM roles (`roles/datastore.user`, `roles/secretmanager.secretAccessor`, `roles/logging.logWriter`), deploys the `gemini-code-guru` Cloud Run service in `asia-south1`, and schedules `code-guru-reconcile` every 10 minutes.
-3. **Verify health, compatibility specs & dashboard**:
+   `deploy.sh` creates the `code-guru` service account with least-privilege IAM roles (`roles/datastore.user`, `roles/secretmanager.secretAccessor`, `roles/logging.logWriter`), deploys the `gemini-code-guru` Cloud Run service in `asia-south1` with `DASHBOARD_USER=admin` and `DASHBOARD_PASSWORD=dashboard-password:latest`, and schedules `code-guru-reconcile` every 10 minutes.
+3. **Verify authentication, compatibility specs & dashboard**:
    ```bash
-   curl <ORCHESTRATOR_URL>/healthz         # Expect: {"ok":true}
-   curl <ORCHESTRATOR_URL>/compatibility   # Returns Gemini Managed Agents platform limits JSON
+   DASH_PW=$(gcloud secrets versions access latest --secret dashboard-password)
+   curl -i <ORCHESTRATOR_URL>/metrics                         # Expect: HTTP 401 Unauthorized
+   curl -u "admin:$DASH_PW" <ORCHESTRATOR_URL>/compatibility  # Returns Gemini Managed Agents platform limits JSON
+   curl -u "admin:$DASH_PW" <ORCHESTRATOR_URL>/metrics        # Returns live metrics JSON
    ```
 
 ---
@@ -409,16 +428,20 @@ export GH_TOKEN="<your-fine-grained-github-pat>"
 
 This section provides a complete, self-contained playbook to test every layer of `gemini-code-guru`—from offline unit tests and pre-flight compatibility gates to live sandbox hook verification and end-to-end issue-to-PR workflows.
 
-### Test 1: Offline Orchestrator, Pre-Flight Gate & Hook Unit Tests (No Cloud / No API Keys Needed)
+### Test 1: Offline Orchestrator, Pre-Flight Gate, Auth, Cost & Hook Unit Tests (No Cloud / No API Keys Needed)
 
-`orchestrator/test_flow.py` runs entirely in-memory (`STORE=memory`) using fake Gemini and GitHub backends plus subprocess invocations of `gate.py` and `paths.py`. It tests:
-1. **Happy path (`test_label_to_pr_to_merge_and_metrics`)**: Labeling an issue `agent:remediate` queues and starts a background interaction, posts the start comment, handles the signed `interaction.completed` Gemini webhook, swaps labels to `agent:pr-open`, records the `pull_request.closed` merge event, and verifies dashboard metrics (`pr_rate == 0.5`, `merge_rate == 1.0`).
-2. **Multi-skill routing (`test_multi_skill_routing_feature_and_modernize`)**: Verifies that `agent:feature` dispatches `feature-build`, `agent:modernize` dispatches `code-modernize`, and `by_task_type` metrics count each category.
-3. **Pre-Flight Compatibility Gate (`test_preflight_issue_gate_short_circuits_incompatible_workloads`)**: Verifies that labeling issues requesting Native Windows (`.NET Framework 4.7.2` WinForms/WPF), Native iOS (`xcodebuild`), or GPU (`nvcc` CUDA kernel) short-circuits immediately to `needs_human` (`agent:needs-human`) with **0 remote sandboxes created (`fi.n == 0`)** and increments `preflight_blocked`.
-4. **Compatibility & Pre-Flight HTTP Endpoints (`test_compatibility_and_preflight_endpoints`)**: Verifies `GET /compatibility` and `POST /preflight` accurately pass Linux-compatible repos and flag oversized repos (`>500 MB`), SSH git URLs, `.vcxproj`/`.xcodeproj` files, and private RFC1918 allowlist domains.
-5. **Reconciler timeout & backfill (`test_reconcile_timeout_and_backfill`)**: Verifies that `POST /reconcile` cancels interactions running longer than 60 minutes (`status="timeout"`) and backfills labeled GitHub issues whose webhook delivery was missed.
-6. **Webhook authentication (`test_gemini_webhook_signature_and_dedupe`)**: Verifies 401/400 rejection on invalid bearer tokens or invalid HMAC signatures and deduplicates repeated deliveries.
-7. **Deterministic hooks (`test_security_gate` & `test_protected_paths_hook`)**: Verifies `gate.py` and `paths.py` allow safe operations and deny unsafe commands/paths (including `msbuild.exe`, `xcodebuild`, `insmod`, and `docker run --privileged`).
+`orchestrator/test_flow.py` runs entirely in-memory (`STORE=memory`) using fake Gemini and GitHub backends plus subprocess invocations of `gate.py` and `paths.py`. It tests 12 scenarios:
+1. **Result line parser (`test_parse_result`)**: Verifies extraction of `PR_OPENED`, `NEEDS_HUMAN`, and fallback `FAILED`.
+2. **GitHub HMAC verification (`test_bad_signature_rejected`)**: Verifies `401` rejection on invalid `X-Hub-Signature-256`.
+3. **Happy path (`test_label_to_pr_to_merge_and_metrics`)**: Labeling an issue `agent:remediate` queues and starts a background interaction, posts the start comment, handles the signed `interaction.completed` Gemini webhook, swaps labels to `agent:pr-open`, records the `pull_request.closed` merge event, and verifies dashboard metrics (`pr_rate == 0.5`, `merge_rate == 1.0`).
+4. **Multi-skill routing (`test_multi_skill_routing_feature_and_modernize`)**: Verifies that `agent:feature` dispatches `feature-build`, `agent:modernize` dispatches `code-modernize`, and `by_task_type` metrics count each category.
+5. **Pre-Flight Compatibility Gate (`test_preflight_issue_gate_short_circuits_incompatible_workloads`)**: Verifies that labeling issues requesting Native Windows (`.NET Framework 4.7.2` WinForms/WPF), Native iOS (`xcodebuild`), or GPU (`nvcc` CUDA kernel) short-circuits immediately to `needs_human` (`agent:needs-human`) with **0 remote sandboxes created (`fi.n == 0`)** and increments `preflight_blocked`.
+6. **Compatibility & Pre-Flight HTTP Endpoints (`test_compatibility_and_preflight_endpoints`)**: Verifies `GET /compatibility` and `POST /preflight` accurately pass Linux-compatible repos and flag oversized repos (`>500 MB`), SSH git URLs, `.vcxproj`/`.xcodeproj` files, and private RFC1918 allowlist domains.
+7. **Reconciler timeout & backfill (`test_reconcile_timeout_and_backfill`)**: Verifies that `POST /reconcile` cancels interactions running longer than 60 minutes (`status="timeout"`) and backfills labeled GitHub issues whose webhook delivery was missed.
+8. **Gemini Webhook authentication (`test_gemini_webhook_signature_and_dedupe`)**: Verifies 401/400 rejection on invalid bearer tokens or invalid HMAC signatures and deduplicates repeated deliveries.
+9. **Deterministic hooks (`test_security_gate` & `test_protected_paths_hook`)**: Verifies `gate.py` and `paths.py` allow safe operations and deny unsafe commands/paths (including `msbuild.exe`, `xcodebuild`, `insmod`, and `docker run --privileged`).
+10. **Dashboard & API Authentication (`test_dashboard_auth_session_basic_and_bearer`)**: Verifies `401` on unauthenticated `/`, `/metrics`, `/runs`, `/compatibility` when `DASHBOARD_PASSWORD` is set, and tests Browser Form Session Cookie login (`POST /login`), HTTP Basic Auth, Bearer Token auth, and `GET /logout`.
+11. **Sandbox Runtime & Cost-per-Run Telemetry (`test_sandbox_runtime_and_cost_per_run_metrics`)**: Verifies per-run `sandbox_s`, `provision_s`, `cached_tokens`, `cost_usd`, `sandbox_minutes_p50`, `cache_hit_rate`, and `usd_per_run_avg`.
 
 Run the suite locally:
 
@@ -437,9 +460,9 @@ Before wiring webhooks, run a single synchronous interaction against your saved 
 ```python
 from google import genai
 
-client = genai.Client()
+client = genai.Client(http_options={"api_version": "v1beta"})
 run = client.interactions.create(
-    agent="gemini-code-guru",
+    agent="code-guru",
     environment="remote",
     input=(
         "List the top-level folders of /workspace/repo, then run `git push origin master`, "
@@ -508,9 +531,9 @@ gh issue edit <WIN_ISSUE_NUMBER> -R "$R" --add-label agent:modernize
 
 ## 10. Observability, Metrics & Cloud Logging
 
-### Executive Dashboard (`GET /`, `GET /metrics`, and `GET /compatibility`)
+### Authenticated Executive Dashboard (`GET /login`, `GET /`, `GET /metrics`, `GET /runs`, and `GET /compatibility`)
 
-The live dashboard at `<ORCHESTRATOR_URL>/` refreshes every 30 seconds and answers key operational questions at a glance:
+When `DASHBOARD_PASSWORD` is configured, all observability endpoints require authentication via **Browser Session Cookie** (`GET /login` $\rightarrow$ `POST /login`), **HTTP Basic Auth** (`-u admin:<password>`), or **Bearer Token** (`Authorization: Bearer <password>`). The live dashboard at `<ORCHESTRATOR_URL>/` refreshes every 30 seconds and answers key operational questions at a glance:
 
 | Question | Metric Tile | Source / Calculation in `/metrics` |
 | :--- | :--- | :--- |
@@ -518,9 +541,10 @@ The live dashboard at `<ORCHESTRATOR_URL>/` refreshes every 30 seconds and answe
 | **Does the agent produce PRs?** | **PR-opened rate** | `pr_rate` = `pr_opened / finished_runs` |
 | **Are the agent's PRs mergeable?** | **Merge rate** | `merge_rate` = `merged_prs / closed_agent_prs` (tracked via `pull_request.closed` webhook) |
 | **Does it know its limits?** | **Escalated to humans** *(including pre-flight blocks)* | `escalation_rate` = `needs_human / finished_runs` and `preflight_blocked` |
-| **How fast is an agent run?** | **Time to PR (p50 / p90)** | `time_to_pr_minutes_p50` and `time_to_pr_minutes_p90` |
+| **How long does the sandbox run?** | **Sandbox Runtime (p50 / p90)** + cumulative minutes | `sandbox_minutes_p50`, `sandbox_minutes_p90`, `sandbox_minutes_total`, and per-run `sandbox_s` |
 | **Is the exposure window shrinking?** | **Issue $\rightarrow$ PR (p50)** | `issue_to_pr_hours_p50` (hours from GitHub `issue.created_at` to `pr_opened`) |
-| **What does each PR cost?** | **Tokens per PR** (and `$` if `USD_PER_MTOK` is set) | `tokens_per_pr` and `usd_per_pr` |
+| **How many tokens are cached vs billed?** | **Tokens per PR** + **Cache Hit Rate (%)** | `tokens_per_pr`, `tokens_per_run_avg`, and `cache_hit_rate` (`cached_tokens / input_tokens`, typically ~90%) |
+| **What does each sandbox run / PR cost?** | **Est. Cost per Sandbox Run** (`$ / run`, `$ / PR`, `$ total`) | `usd_per_run_avg`, `usd_per_pr`, `usd_total`, and per-run `cost_usd` (computed from uncached input `$0.15/1M`, cached input `$0.0375/1M`, and output/thought `$0.60/1M`) |
 | **Is throughput steady?** | **PRs opened per day (last 14 days)** | SVG bar chart rendered from `prs_per_day_14d` |
 
 ### Structured Cloud Logging Queries

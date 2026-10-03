@@ -66,12 +66,12 @@ if PRESET not in PRESETS:
     raise SystemExit(f"Unknown PRESET={PRESET!r}. Choose from: {', '.join(PRESETS)}")
 
 REPO = os.environ.get("REPO", PRESETS[PRESET]["repo"])
-AGENT_ID = os.environ.get("AGENT_ID", "gemini-code-guru")
+AGENT_ID = os.environ.get("AGENT_ID", "code-guru")
 BASE_AGENT = os.environ.get("BASE_AGENT", "antigravity-preview-05-2026")
 MODEL = os.environ.get("AGENT_MODEL", "gemini-3.8-flash")
 MAX_TOTAL_TOKENS = int(os.environ.get("MAX_TOTAL_TOKENS", "3000000"))  # per-run budget
 TRIGGER_NAME = os.environ.get("TRIGGER_NAME", "code-guru-weekly-triage")
-WEBHOOK_NAME = os.environ.get("WEBHOOK_NAME", "gemini-code-guru")
+WEBHOOK_NAME = os.environ.get("WEBHOOK_NAME", "code-guru")
 
 
 def get_client():
@@ -274,14 +274,13 @@ def cmd_agent(args):
 def cmd_webhook(args):
     client = get_client()
     target_uri = args.url.rstrip("/") + "/gemini-webhook"
-    for existing in client.webhooks.list() or []:
+    for existing in client.webhooks.list().webhooks or []:
         if getattr(existing, "name", None) == WEBHOOK_NAME or getattr(existing, "uri", None) == target_uri:
             client.webhooks.delete(id=existing.id)
             print(f"replaced existing webhook {existing.id}")
     wh = client.webhooks.create(
         name=WEBHOOK_NAME,
-        subscribed_events=["interaction.completed", "interaction.failed",
-                           "interaction.cancelled", "interaction.requires_action"],
+        subscribed_events=["interaction.completed", "interaction.failed", "interaction.requires_action"],
         uri=target_uri,
     )
     print(f"webhook {wh.id} -> {wh.uri}")
@@ -314,7 +313,7 @@ def cmd_trigger(args):
         time_zone="Asia/Kolkata",
         display_name=TRIGGER_NAME,
         max_consecutive_failures=3,
-        execution_timeout_seconds=3600,
+        execution_timeout_seconds=600,
         interaction={"agent": AGENT_ID, "input": _triage_prompt(repo), "environment": "remote"},
     )
     print(f"trigger {t.id} next run {t.next_run_time}")
@@ -333,7 +332,7 @@ def cmd_status(_):
     client = get_client()
     a = client.agents.get(id=AGENT_ID)
     print("agent:", a.id, "repo:", REPO, "base_agent:", BASE_AGENT, "model:", MODEL)
-    for w in client.webhooks.list() or []:
+    for w in client.webhooks.list().webhooks or []:
         print("webhook:", w.id, w.uri, w.subscribed_events)
     t = _find_trigger(client)
     if t:
